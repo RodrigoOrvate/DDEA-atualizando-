@@ -1,4 +1,3 @@
-pip install --upgrade pip
 streamlit
 pandas
 matplotlib
@@ -7,3 +6,4 @@ plotly
 scipy
 biopython
 statsmodels
+pip install --upgrade pip
