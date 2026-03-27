@@ -6,4 +6,3 @@ plotly
 scipy
 biopython
 statsmodels
-pip install --upgrade pip
