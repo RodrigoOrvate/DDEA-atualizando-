@@ -8,179 +8,215 @@ import gzip
 import io
 import os
 from Bio import Entrez
+import statsmodels.api as sm
 
-# E-mail técnico interno
-Entrez.email = "bioinfo.ufrn@gmail.com"
+# Identificação para evitar erro 401
+HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+Entrez.email = ""
 
-# --- 1. FUNÇÕES COM CACHE (PARA PERFORMANCE) ---
+# --- 1. FUNÇÕES TÉCNICAS REFORMULADAS (DIVISÃO DE TAREFAS) ---
 
-@st.cache_data
-def get_gene_mapping(gse_id):
-    """Busca mapeamento Probe -> Symbol."""
+def quantile_normalize(df_values):
+    """Normalização por quantis otimizada (float32 para economizar RAM)."""
+    sorted_df = np.sort(df_values.astype(np.float32), axis=0)
+    rank_mean = sorted_df.mean(axis=1)
+    indices = np.argsort(df_values, axis=0)
+    norm_mat = np.empty_like(df_values, dtype=np.float32)
+    for i in range(df_values.shape[1]):
+        norm_mat[indices[:, i], i] = rank_mean
+    return norm_mat
+
+@st.cache_data(show_spinner=False)
+def get_gene_mapping_stepped(gse_id, probe_ids):
+    """Passo 2: Mapeamento cirúrgico de símbolos."""
     try:
-        h = Entrez.esummary(db="gds", id=gse_id.replace("GSE", ""))
-        record = Entrez.read(h)
+        search = Entrez.read(Entrez.esearch(db="gds", term=f"{gse_id}[ACCN]"))
+        uid = search["IdList"][0]
+        record = Entrez.read(Entrez.esummary(db="gds", id=uid))
         gpl_id = record[0]['GPL']
-        gpl_prefix = f"GPL{gpl_id[:-3]}nnn" if len(gpl_id) > 3 else "GPLnnn"
-        url = f"https://ftp.ncbi.nlm.nih.gov/geo/platforms/{gpl_prefix}/GPL{gpl_id}/soft/GPL{gpl_id}_family.soft.gz"
-        r = requests.get(url)
-        with gzip.open(io.BytesIO(r.content), 'rt') as f:
+        gpl_num = gpl_id.replace("GPL", "")
+        prefix = f"GPL{gpl_num[:-3]}nnn" if len(gpl_num) > 3 else "GPLnnn"
+        url = f"https://ftp.ncbi.nlm.nih.gov/geo/platforms/{prefix}/GPL{gpl_id}/soft/GPL{gpl_id}_family.soft.gz"
+        
+        r = requests.get(url, stream=True, headers=HEADERS)
+        with gzip.open(r.raw, 'rt', encoding='utf-8', errors='ignore') as f:
             for line in f:
-                if line.startswith('!platform_table_begin'):
-                    map_df = pd.read_csv(f, sep='\t', comment='!')
-                    sym_col = next((c for c in map_df.columns if any(k in c.upper() for k in ['SYMBOL', 'GENE_SYMBOL'])), None)
-                    if sym_col:
-                        return map_df[['ID', sym_col]].rename(columns={'ID': 'Probe_ID', sym_col: 'Symbol'})
+                if line.startswith('!platform_table_begin'): break
+            
+            # Carrega apenas as colunas necessárias para não dar 404
+            map_df = pd.read_csv(f, sep='\t', comment='!', low_memory=True, on_bad_lines='skip')
+            target_cols = ['Gene.Symbol', 'Gene Symbol', 'GENE_SYMBOL', 'Symbol']
+            sym_col = next((c for c in map_df.columns if any(k == c or k == c.upper() for k in target_cols)), None)
+            
+            if sym_col:
+                map_df = map_df[map_df['ID'].astype(str).isin(probe_ids)]
+                map_df[sym_col] = map_df[sym_col].astype(str).apply(lambda x: x.split(' /// ')[0])
+                return map_df[['ID', sym_col]].rename(columns={'ID': 'Probe_ID', sym_col: 'Symbol'})
         return None
     except: return None
 
 @st.cache_data
-def get_series_matrix(gse_id):
-    """Baixa a matriz bruta."""
-    gse_prefix = gse_id[:5] + "nnn"
-    url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{gse_prefix}/{gse_id}/matrix/{gse_id}_series_matrix.txt.gz"
+def get_geo_matrix_stepped(gse_id):
+    """Passo 1: Download da matriz e metadados com busca robusta de cabeçalho."""
+    num = gse_id.replace("GSE", "")
+    prefix = f"GSE{num[:-3]}nnn" if len(num) > 3 else "GSEnnn"
+    url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{prefix}/{gse_id}/matrix/{gse_id}_series_matrix.txt.gz"
+    
     try:
-        r = requests.get(url)
-        if r.status_code != 200: return None, None, "GSE não encontrado."
+        r = requests.get(url, stream=True, headers=HEADERS)
+        if r.status_code != 200: return None, None, f"Erro {r.status_code}: Acesso negado."
+        
         with gzip.open(io.BytesIO(r.content), 'rt') as f:
-            lines = f.readlines()
-            sample_titles = [l.split('\t')[1:] for l in lines if l.startswith('!Sample_title')]
-            titles = [t.strip().replace('"', '') for t in sample_titles[0]] if sample_titles else []
-            data_start = next(i for i, line in enumerate(lines) if not line.startswith('!'))
-            clean_data = [l for l in lines[data_start:] if not l.startswith('!') and l.strip()]
-            df = pd.read_csv(io.StringIO("".join(clean_data)), sep='\t')
+            titles, gsms, data_buffer = [], [], []
+            found_data = False
+            
+            for line in f:
+                if line.startswith('!Sample_title'): titles = [t.strip().replace('"', '') for t in line.split('\t')[1:]]
+                if line.startswith('!Sample_geo_accession'): gsms = [t.strip().replace('"', '') for t in line.split('\t')[1:]]
+                # Busca robusta pelo início dos dados
+                if not line.startswith('!') and len(line.split('\t')) > 1:
+                    data_buffer.append(line)
+                    found_data = True
+                    # Lê o restante do arquivo de uma vez para o buffer
+                    data_buffer.extend(f.readlines())
+                    break
+            
+            if not found_data: return None, None, "Não foi possível encontrar a tabela de dados no arquivo."
+
+            # Processa a matriz
+            df = pd.read_csv(io.StringIO("".join(data_buffer)), sep='\t')
+            # Mapeia GSM para Título Original
+            name_map = dict(zip(gsms, titles)) if gsms and titles else {}
+            
+            # Limpeza e conversão para float32 (Economia de RAM)
+            new_cols = [df.columns[0]] + [name_map.get(c.replace('"', ''), c.replace('"', '')) for c in df.columns[1:]]
+            df.columns = new_cols
             for col in df.columns[1:]:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            return df.dropna(subset=df.columns[1:], how='all'), titles, None
+                df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
+            
+            return df.dropna(subset=df.columns[1:], how='all'), df.columns[1:].tolist(), None
     except Exception as e: return None, None, str(e)
 
-# --- 2. INTERFACE E LÓGICA ---
+# --- 2. INTERFACE STREAMLIT ---
 
 def run_app():
-    st.set_page_config(layout="wide", page_title="DDEA Pro UFRN")
+    st.set_page_config(layout="wide", page_title="DDEA Ultra Complete")
     st.title("Diagonal Differential Expression Alley 🧬")
 
-    # Sidebar sempre visível
+    if 'groups' not in st.session_state: st.session_state['groups'] = {}
+
     with st.sidebar:
         if os.path.exists("DDEA-small.png"): st.image("DDEA-small.png", use_container_width=True)
-        st.header("1. Data Retrieval")
-        gse_id = st.text_input("GSE ID:", placeholder="Ex: GSE78093")
-        
-        # Botão para buscar dados (Reset no reload garantido aqui)
-        fetch_btn = st.button("🔍 Fetch from GEO", use_container_width=True)
+        st.header("1. Experiment Setup")
+        exp_mode = st.radio("Experiment Type:", ["Microarray", "RNASeq"])
+        gse_input = st.text_input("GSE ID:", value="GSE78093")
         
         st.divider()
-        st.header("2. DDEA Thresholds")
-        # Estes sliders são reativos: mudou aqui, mudam os gráficos lá embaixo
-        p_thr = st.slider("P-value (α):", 0.001, 0.10, 0.05, format="%.3f")
-        fc_thr = st.slider("Min Abs Log2(FC):", 0.0, 5.0, 1.0)
+        st.header("2. Gene Search Filter")
+        gene_txt = st.text_area("Specific Genes (1 per line):")
+        uploaded_txt = st.file_uploader("Upload .txt list", type="txt")
+        
+        st.divider()
+        st.header("3. DDEA Parameters")
+        use_limma = st.checkbox("Linear Model (Limma-like)", value=False)
+        p_thr = st.slider("P-value threshold:", 0.001, 0.10, 0.05, format="%.3f")
+        fc_thr = st.slider("Min Abs Log2(FC):", 0.0, 5.0, 0.0, step=0.1)
         max_plot = st.number_input("Max genes to plot:", value=20)
+        
+        fetch_btn = st.button("🔍 Fetch from GEO", use_container_width=True)
 
-    # Lógica de Carregamento
-    if fetch_btn and gse_id:
-        with st.spinner("Downloading data..."):
-            df, titles, err = get_series_matrix(gse_id)
+    # Coleta de genes para filtro customizado
+    c_genes = [g.strip().upper() for g in gene_txt.split('\n') if g.strip()]
+    if uploaded_txt:
+        c_genes += [line.decode('utf-8').strip().upper() for line in uploaded_txt.readlines()]
+
+    if fetch_btn and gse_input:
+        with st.spinner("🚀 Passo 1: Baixando Matriz e Títulos Reais..."):
+            df, titles, err = get_geo_matrix_stepped(gse_input)
             if not err:
-                st.session_state['raw_df'] = df
-                st.session_state['titles'] = titles
-                st.session_state['mapping'] = get_gene_mapping(gse_id)
-                st.session_state['analysis_done'] = False # Reseta a análise se buscar novo GSE
+                st.session_state['df'], st.session_state['titles'] = df, titles
+                with st.spinner("🧬 Passo 2: Mapeando Gene Symbols (RAM-Safe)..."):
+                    st.session_state['mapping'] = get_gene_mapping_stepped(gse_input, df.iloc[:, 0].astype(str).tolist())
+                st.session_state['groups'] = {"Control": titles[:len(titles)//2], "Experimental": titles[len(titles)//2:]}
+                st.session_state['analysis_done'] = False
             else: st.error(err)
 
-    # Se os dados estão carregados, mostramos a gestão de grupos
-    if 'raw_df' in st.session_state:
-        df, titles = st.session_state['raw_df'], st.session_state['titles']
+    if 'df' in st.session_state:
+        df, titles = st.session_state['df'], st.session_state['titles']
         
-        with st.expander("📄 Raw Matrix Preview (Head)", expanded=False):
-            st.dataframe(df.head(10), use_container_width=True)
-
         st.subheader("🛠️ Group Management")
-        c1, c2 = st.columns(2)
-        with c1: 
-            g1_name = st.text_input("Group 1 Name:", value="Control")
-            g1_sel = st.multiselect(f"Samples for {g1_name}:", titles, default=titles[:3])
-        with c2:
-            g2_name = st.text_input("Group 2 Name:", value="Experimental")
-            g2_sel = st.multiselect(f"Samples for {g2_name}:", titles, default=titles[3:])
+        groups = st.session_state['groups']
+        new_g = st.text_input("Add New Group Name:")
+        if st.button("➕ Add Group") and new_g:
+            groups[new_g] = []; st.session_state['groups'] = groups; st.rerun()
 
-        # BOTÃO PARA RODAR A ANÁLISE (Obrigatório clicar uma vez)
-        if st.button("🔥 Run DDEA Analysis", use_container_width=True):
-            if g1_sel and g2_sel:
-                with st.spinner("Calculating Statistics..."):
-                    ids_gsm = df.columns[1:]
-                    cols1 = [ids_gsm[titles.index(t)] for t in g1_sel]
-                    cols2 = [ids_gsm[titles.index(t)] for t in g2_sel]
-                    
-                    m1, m2 = df[cols1].values.astype(float), df[cols2].values.astype(float)
-                    lfc = np.nanmean(m2, axis=1) - np.nanmean(m1, axis=1)
-                    pvals = stats.ttest_ind(m2, m1, axis=1, equal_var=False, nan_policy='omit').pvalue
-                    
-                    res = pd.DataFrame({
-                        'Probe_ID': df.iloc[:, 0].astype(str),
-                        'Log2FC': lfc, 'PValue': pvals,
-                        'neg_log10_p': -np.log10(pvals + 1e-10)
-                    }).dropna()
+        # Configuração de múltiplos grupos
+        updated_groups = {}
+        cols_g = st.columns(3)
+        for i, (g_name, g_samples) in enumerate(list(groups.items())):
+            with cols_g[i % 3]:
+                n_name = st.text_input(f"Name:", value=g_name, key=f"n_{g_name}")
+                sel = st.multiselect(f"Samples:", titles, default=g_samples, key=f"s_{g_name}")
+                updated_groups[n_name] = sel
+                if st.button(f"🗑️ Remove {n_name}", key=f"del_{g_name}"):
+                    del st.session_state['groups'][g_name]; st.rerun()
+        st.session_state['groups'] = updated_groups
 
+        st.divider()
+        if len(updated_groups) >= 2:
+            c1, c2 = st.columns(2)
+            ref_g = c1.selectbox("Control (Ref):", list(updated_groups.keys()))
+            test_g = c2.selectbox("Experimental:", [g for g in updated_groups.keys() if g != ref_g])
+
+            if st.button("🔥 Run Analysis (Normalized)", use_container_width=True):
+                with st.spinner("Calculando..."):
+                    c_ref, c_test = updated_groups[ref_g], updated_groups[test_g]
+                    data_vals = df[c_ref + c_test].values
+                    if np.nanmax(data_vals) > 50: data_vals = np.log2(data_vals + 1.0)
+                    data_norm = pd.DataFrame(quantile_normalize(data_vals), columns=c_ref + c_test, index=df.index)
+                    
+                    m1, m2 = data_norm[c_ref].values, data_norm[c_test].values
+                    if use_limma:
+                        p_l, f_l = [], []
+                        for row in range(len(data_norm)):
+                            y, x = np.concatenate([m1[row], m2[row]]), sm.add_constant(np.concatenate([np.zeros(len(c_ref)), np.ones(len(c_test))]))
+                            res_sm = sm.OLS(y, x).fit()
+                            p_l.append(res_sm.pvalues[1]); f_l.append(res_sm.params[1])
+                        pvals, lfc = np.array(p_l), np.array(f_l)
+                    else:
+                        lfc = np.nanmean(m2, axis=1) - np.nanmean(m1, axis=1)
+                        pvals = stats.ttest_ind(m2, m1, axis=1, equal_var=False, nan_policy='omit').pvalue
+                    
+                    res = pd.DataFrame({'Probe_ID': df.iloc[:, 0].astype(str), 'Log2FC': lfc, 'PValue': pvals, 'neg_log10_p': -np.log10(pvals + 1e-10)}).dropna()
                     if st.session_state.get('mapping') is not None:
                         res = res.merge(st.session_state['mapping'], on='Probe_ID', how='left')
-                        res['Symbol'] = res['Symbol'].fillna(res['Probe_ID'])
+                        res['Symbol'] = res['Symbol'].replace(['nan', '---', ' '], np.nan).fillna(res['Probe_ID'])
                     else: res['Symbol'] = res['Probe_ID']
-                    
-                    st.session_state['res'] = res
-                    st.session_state['analysis_done'] = True
-            else: st.warning("Please select samples for both groups.")
+                    st.session_state.update({'res': res, 'norm_df': data_norm, 'analysis_done': True, 'rn': ref_g, 'tn': test_g})
 
         # --- EXIBIÇÃO REATIVA ---
         if st.session_state.get('analysis_done'):
             res = st.session_state['res']
-            df_diff = res[(res['PValue'] < p_thr) & (res['Log2FC'].abs() >= fc_thr)].copy()
-            df_diff = df_diff.sort_values(by='Log2FC', key=abs, ascending=False)
-
-            st.divider()
-            st.subheader(f"Results: {g2_name} vs {g1_name}")
-            col_m1, col_m2 = st.columns(2)
-            col_m1.metric("Total Unique Genes", len(res))
-            col_m2.metric("Differentially Expressed", len(df_diff))
+            if c_genes: res = res[res['Symbol'].str.upper().isin(c_genes)]
+            df_diff = res[(res['PValue'] < p_thr) & (res['Log2FC'].abs() >= fc_thr)].sort_values('Log2FC', key=abs, ascending=False)
 
             if not df_diff.empty:
-                # 🌡️ HEATMAP
-                st.subheader("1. Gene Expression Heatmap")
-                top_30 = df_diff.head(30)
-                h_data = df[df.iloc[:, 0].isin(top_30['Probe_ID'])]
-                z_vals = (h_data[df.columns[1:]].values - np.nanmean(h_data[df.columns[1:]].values, axis=1, keepdims=True)) / np.nanstd(h_data[df.columns[1:]].values, axis=1, keepdims=True)
-                
-                fig_h = px.imshow(z_vals, x=titles, y=top_30['Symbol'].tolist(),
-                                  color_continuous_scale='RdBu_r', aspect="auto", height=750)
-                st.plotly_chart(fig_h, use_container_width=True)
+                st.subheader(f"1. Heatmap: {st.session_state['tn']} vs {st.session_state['rn']}")
+                top30 = df_diff.head(30)
+                # Amostras originais no Heatmap
+                h_mat = st.session_state['norm_df'].loc[top30.index].values
+                h_z = (h_mat - np.mean(h_mat, axis=1, keepdims=True)) / (np.std(h_mat, axis=1, keepdims=True) + 1e-9)
+                st.plotly_chart(px.imshow(h_z, y=top30['Symbol'].tolist(), color_continuous_scale='RdBu_r', height=750, aspect="auto"), use_container_width=True)
 
-                # 📊 BAR CHARTS
                 st.divider()
                 st.subheader("2. Expression Patterns")
-                c_all, c_up, c_down = st.columns(3)
-                with c_all:
-                    st.write("**All DEGs**")
-                    st.plotly_chart(px.bar(df_diff.head(max_plot), x='Symbol', y='Log2FC', color='Log2FC', color_continuous_scale='Viridis'), use_container_width=True)
-                with c_up:
-                    st.write("**Upregulated**")
-                    up = df_diff[df_diff['Log2FC'] > 0].head(max_plot)
-                    st.plotly_chart(px.bar(up, x='Symbol', y='Log2FC', color='Log2FC', color_continuous_scale='Blues'), use_container_width=True)
-                with c_down:
-                    st.write("**Downregulated**")
-                    down = df_diff[df_diff['Log2FC'] < 0].head(max_plot)
-                    st.plotly_chart(px.bar(down, x='Symbol', y='Log2FC', color='Log2FC', color_continuous_scale='Reds_r'), use_container_width=True)
+                c1, c2, c3 = st.columns(3)
+                c1.plotly_chart(px.bar(df_diff.head(max_plot), x='Symbol', y='Log2FC', color='Log2FC', color_continuous_scale='Viridis', title="Top DEGs"), use_container_width=True)
+                c2.plotly_chart(px.bar(df_diff[df_diff['Log2FC']>0].head(max_plot), x='Symbol', y='Log2FC', color='Log2FC', color_continuous_scale='Blues', title="UP Genes"), use_container_width=True)
+                c3.plotly_chart(px.bar(df_diff[df_diff['Log2FC']<0].head(max_plot), x='Symbol', y='Log2FC', color='Log2FC', color_continuous_scale='Reds_r', title="DOWN Genes"), use_container_width=True)
 
-                # 📋 TABELA FINAL
-                st.divider()
                 st.subheader("3. Detailed Results Table")
-                df_disp = df_diff[['Symbol', 'Log2FC', 'neg_log10_p']].rename(columns={
-                    'Symbol': 'Gene Symbol', 'Log2FC': 'Log2(FoldChange)', 'neg_log10_p': '-log10(Pvalue)'
-                })
-                st.dataframe(df_disp, use_container_width=True)
-                
-                tsv = df_disp.to_csv(index=False, sep='\t').encode('utf-8')
-                st.download_button("📥 Download TSV", tsv, f"DDEA_{g2_name}_vs_{g1_name}.tsv", "text/tab-separated-values")
-            else:
-                st.warning("No genes passed the thresholds. Adjust the sliders in the sidebar.")
+                df_f = df_diff[['Symbol', 'Log2FC', 'neg_log10_p']].rename(columns={'Symbol': 'Gene Symbol', 'Log2FC': 'Log2(FoldChange)', 'neg_log10_p': '-log10(Pvalue)'})
+                st.dataframe(df_f, use_container_width=True)
 
-if __name__ == '__main__':
-    run_app()
+if __name__ == '__main__': run_app()
