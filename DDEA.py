@@ -11,8 +11,8 @@ import gc
 from Bio import Entrez
 import statsmodels.api as sm
 
-HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleBio/1.0'}
-Entrez.email = "rodrigo.arruda@ufrn.edu.br"
+HEADERS = {'User-Agent': 'DDEA/1.0 (Streamlit App; +https://github.com)'}
+Entrez.email = "ddea.tool@example.com"
 
 
 # ============================================================
@@ -119,12 +119,18 @@ def get_gene_mapping_microarray(gse_id):
 # MAPEAMENTO — RNA-SEQ
 # ============================================================
 
+def _strip_ensembl_version(ensembl_id: str) -> str:
+    """Remove sufixo de versão de Ensembl IDs: ENSG00000129824.11 → ENSG00000129824"""
+    return ensembl_id.split('.')[0] if '.' in ensembl_id else ensembl_id
+
+
 @st.cache_data(show_spinner=False)
 def get_gene_mapping_rnaseq(index_ids: tuple, id_type: str):
     """
     Converte IDs para Gene Symbol conforme o tipo detectado.
     - entrez  → MyGene.info POST com field=symbol
     - ensembl → MyGene.info POST com field=symbol, scopes=ensembl.gene
+                (remove sufixo de versão, ex: ENSG00000129824.11 → ENSG00000129824)
     - symbol  → já é símbolo, retorna identidade
     - probe/unknown → retorna None (não tenta)
     """
@@ -139,9 +145,20 @@ def get_gene_mapping_rnaseq(index_ids: tuple, id_type: str):
     if id_type == 'entrez':
         ids_clean = [str(i).strip() for i in index_ids if str(i).strip().isdigit()]
         scope = "entrezgene"
+        # Para entrez, o ID original == ID limpo
+        original_to_clean = {i: i for i in ids_clean}
     else:
-        ids_clean = [str(i).strip() for i in index_ids if str(i).strip().startswith('ENS')]
+        # Ensembl: remove versão para consulta, mas mantém mapeamento de volta
+        ids_raw = [str(i).strip() for i in index_ids if str(i).strip().startswith('ENS')]
         scope = "ensembl.gene"
+        # Mapa: ID original (com versão) → ID sem versão
+        original_to_clean = {i: _strip_ensembl_version(i) for i in ids_raw}
+        # Mapa reverso: ID sem versão → ID original (primeiro encontrado)
+        clean_to_original = {}
+        for orig, clean in original_to_clean.items():
+            if clean not in clean_to_original:
+                clean_to_original[clean] = orig
+        ids_clean = list(clean_to_original.keys())
 
     if not ids_clean:
         return None, "Nenhum ID válido encontrado para conversão."
@@ -166,7 +183,12 @@ def get_gene_mapping_rnaseq(index_ids: tuple, id_type: str):
                     continue
                 query_id = str(item.get('query', ''))
                 symbol = item.get('symbol', None)
-                results.append({"Probe_ID": query_id, "Symbol": symbol})
+                if id_type == 'ensembl' and query_id in clean_to_original:
+                    # Mapeia de volta para o ID original com versão
+                    original_id = clean_to_original[query_id]
+                    results.append({"Probe_ID": original_id, "Symbol": symbol})
+                else:
+                    results.append({"Probe_ID": query_id, "Symbol": symbol})
         except Exception as e:
             return None, f"MyGene.info erro: {e}"
 
@@ -175,6 +197,19 @@ def get_gene_mapping_rnaseq(index_ids: tuple, id_type: str):
 
     mapping_df = pd.DataFrame(results).drop_duplicates('Probe_ID')
     mapping_df["Symbol"] = mapping_df["Symbol"].fillna(mapping_df["Probe_ID"])
+    # Para Ensembl, adicionar IDs que ficaram sem mapeamento (versões duplicadas etc.)
+    if id_type == 'ensembl':
+        mapped_set = set(mapping_df['Probe_ID'])
+        for orig, clean in original_to_clean.items():
+            if orig not in mapped_set:
+                # Tentar encontrar o símbolo pelo ID sem versão
+                match = mapping_df[mapping_df['Probe_ID'].apply(_strip_ensembl_version) == clean]
+                if not match.empty:
+                    sym = match.iloc[0]['Symbol']
+                    results.append({"Probe_ID": orig, "Symbol": sym})
+        mapping_df = pd.DataFrame(results).drop_duplicates('Probe_ID')
+        mapping_df["Symbol"] = mapping_df["Symbol"].fillna(mapping_df["Probe_ID"])
+
     n_mapped = (mapping_df['Symbol'] != mapping_df['Probe_ID']).sum()
     return mapping_df, f"{n_mapped}/{len(mapping_df)} IDs convertidos para Gene Symbol via MyGene.info ({scope})."
 
@@ -215,11 +250,27 @@ def _parse_matrix_bytes(raw_bytes):
 # SERIES MATRIX — extração de metadados + matriz
 # ============================================================
 
+def _parse_series_type(series_type_raw: str) -> str:
+    """
+    Interpreta o campo !Series_type da Series Matrix e retorna
+    'Microarray', 'RNASeq' ou 'unknown'.
+    """
+    s = series_type_raw.lower()
+    if 'high throughput sequencing' in s:
+        return 'RNASeq'
+    if 'array' in s:
+        return 'Microarray'
+    if 'sequencing' in s:
+        return 'RNASeq'
+    return 'unknown'
+
+
 def _try_series_matrix(gse_id):
     """
     Baixa a series_matrix.
-    Retorna (df_expression_or_None, meta_df, gsms, gsm_order).
+    Retorna (df_expression_or_None, meta_df, gsms, gsm_order, detected_type).
     gsm_order é a lista ordenada de GSMs conforme o cabeçalho.
+    detected_type é 'Microarray', 'RNASeq' ou 'unknown'.
     """
     num = gse_id.replace("GSE", "")
     prefix = f"GSE{num[:-3]}nnn" if len(num) > 3 else "GSEnnn"
@@ -232,8 +283,11 @@ def _try_series_matrix(gse_id):
         r.raise_for_status()
         with gzip.open(io.BytesIO(r.content), 'rt') as f:
             titles, gsms, char_lines, gsm_order = [], [], [], []
+            series_type_raw = ""
             df = pd.DataFrame()
             for line in f:
+                if line.startswith('!Series_type'):
+                    series_type_raw = line.split('\t')[1].strip().replace('"', '') if '\t' in line else ""
                 if line.startswith('!Sample_title'):
                     titles = [t.strip().replace('"', '') for t in line.split('\t')[1:]]
                 if line.startswith('!Sample_geo_accession'):
@@ -244,6 +298,8 @@ def _try_series_matrix(gse_id):
                 if line.startswith('ID_REF') or line.startswith('"ID_REF"'):
                     df = pd.read_csv(f, sep='\t', header=None, low_memory=True)
                     break
+
+            detected_type = _parse_series_type(series_type_raw)
 
             meta_dict = {"Accession": gsms, "Title": titles}
             for row in char_lines:
@@ -256,7 +312,7 @@ def _try_series_matrix(gse_id):
             meta_df = pd.DataFrame(meta_dict)
 
             if df.empty or len(df.columns) < 2:
-                return None, meta_df, gsms, gsm_order
+                return None, meta_df, gsms, gsm_order, detected_type
 
             df = df.set_index(0)
             df.index = df.index.astype(str).str.strip().str.replace('"', '')
@@ -265,13 +321,13 @@ def _try_series_matrix(gse_id):
 
             num_cols = df.select_dtypes(include=[np.number]).shape[1]
             if num_cols < 2:
-                return None, meta_df, gsms, gsm_order
+                return None, meta_df, gsms, gsm_order, detected_type
 
             df = df.select_dtypes(include=[np.number])
-            return df, meta_df, gsms, gsm_order
+            return df, meta_df, gsms, gsm_order, detected_type
 
     except Exception as e:
-        return None, None, None, []
+        return None, None, None, [], 'unknown'
 
 
 def _list_supplementary_urls(gse_id):
@@ -298,6 +354,152 @@ def _score_suppl_file(url):
     if 'log' in name:
         score -= 1
     return score
+
+
+def _try_extract_symbol_mapping_from_suppl(gse_id, ensembl_ids, log_cb=None):
+    """
+    Tenta extrair mapeamento Ensembl→Symbol dos arquivos suplementares do GEO.
+    Muitos datasets RNA-Seq incluem arquivos com colunas como 'gene_name', 'Symbol', etc.
+    Também tenta usar o índice se for gene symbol e há coluna Ensembl.
+    Retorna (mapping_df, msg) ou (None, msg).
+    """
+    urls = sorted(_list_supplementary_urls(gse_id), key=_score_suppl_file, reverse=True)
+    if not urls:
+        return None, "Nenhum arquivo suplementar encontrado."
+
+    # Colunas que indicam gene symbol
+    symbol_keywords = [
+        'gene_name', 'genename', 'gene.name', 'gene symbol', 'gene.symbol',
+        'genesymbol', 'symbol', 'gene_symbol', 'hgnc_symbol', 'external_gene_name',
+        'external_gene_id', 'name', 'genes'
+    ]
+    # Colunas que indicam Ensembl ID
+    ensembl_keywords = [
+        'ensembl', 'ensg', 'gene_id', 'geneid', 'ensembl_gene_id',
+        'ensembl_id', 'gene.id'
+    ]
+
+    ensembl_set_stripped = {_strip_ensembl_version(e) for e in ensembl_ids}
+
+    for url in urls:
+        fname = url.split('/')[-1]
+        try:
+            if log_cb:
+                log_cb(f"Buscando mapping em: `{fname}`")
+            r = requests.get(url, timeout=60, headers=HEADERS)
+            if r.status_code != 200:
+                continue
+
+            try:
+                content = gzip.decompress(r.content)
+            except Exception:
+                content = r.content
+
+            # Tenta ler só as primeiras linhas para detectar colunas
+            for sep in ['\t', ',']:
+                try:
+                    df_test = pd.read_csv(io.BytesIO(content), sep=sep, nrows=5, low_memory=False)
+                    if df_test.shape[1] < 2:
+                        continue
+
+                    cols_lower = {c: c.lower().strip().replace('"', '') for c in df_test.columns}
+
+                    # Encontra coluna de symbol
+                    sym_col = None
+                    for orig, low in cols_lower.items():
+                        if any(kw == low for kw in symbol_keywords):
+                            sym_col = orig
+                            break
+                    if sym_col is None:
+                        for orig, low in cols_lower.items():
+                            if any(kw in low for kw in symbol_keywords):
+                                sym_col = orig
+                                break
+
+                    # Encontra coluna de Ensembl ID
+                    ens_col = None
+                    for orig, low in cols_lower.items():
+                        if any(kw == low for kw in ensembl_keywords):
+                            ens_col = orig
+                            break
+                    if ens_col is None:
+                        for orig, low in cols_lower.items():
+                            if any(kw in low for kw in ensembl_keywords):
+                                ens_col = orig
+                                break
+
+                    if sym_col is None:
+                        # Checar se o índice (primeira coluna após read_csv com index_col=0)
+                        # pode ser gene symbol e outra coluna é Ensembl
+                        continue
+
+                    # Ler o arquivo completo com as colunas de interesse
+                    df_full = pd.read_csv(io.BytesIO(content), sep=sep, low_memory=False)
+                    df_full.columns = [str(c).strip().replace('"', '') for c in df_full.columns]
+
+                    if ens_col and ens_col in df_full.columns and sym_col in df_full.columns:
+                        # Temos ambas as colunas!
+                        map_df = df_full[[ens_col, sym_col]].copy()
+                        map_df.columns = ['Ensembl_ID', 'Symbol']
+                        map_df['Ensembl_ID'] = map_df['Ensembl_ID'].astype(str).str.strip()
+                        map_df['Symbol'] = map_df['Symbol'].astype(str).str.strip()
+                        # Verificar se os Ensembl IDs batem com os do dataset
+                        map_stripped = map_df['Ensembl_ID'].apply(_strip_ensembl_version)
+                        overlap = map_stripped.isin(ensembl_set_stripped).sum()
+                        if overlap >= 10:
+                            # Mapear de volta usando o ID original do dataset
+                            # Cria dict: ensembl_sem_versão → symbol
+                            ens_to_sym = dict(zip(map_stripped, map_df['Symbol']))
+                            result_rows = []
+                            for eid in ensembl_ids:
+                                eid_clean = _strip_ensembl_version(str(eid))
+                                sym = ens_to_sym.get(eid_clean)
+                                if sym and sym not in ('nan', '', 'None', 'NA', '---'):
+                                    result_rows.append({'Probe_ID': str(eid), 'Symbol': sym})
+                            if result_rows:
+                                result_df = pd.DataFrame(result_rows).drop_duplicates('Probe_ID')
+                                n_mapped = len(result_df)
+                                return result_df, f"{n_mapped}/{len(ensembl_ids)} IDs mapeados via arquivo suplementar `{fname}`."
+
+                    elif sym_col in df_full.columns:
+                        # Tem coluna de symbol, vamos checar o índice
+                        df_idx = pd.read_csv(io.BytesIO(content), sep=sep, index_col=0, low_memory=False)
+                        df_idx.index = df_idx.index.astype(str).str.strip()
+                        idx_stripped = {_strip_ensembl_version(i) for i in df_idx.index[:50] if 'ENS' in str(i)}
+                        if len(idx_stripped.intersection(ensembl_set_stripped)) >= 5:
+                            # O índice é Ensembl, e temos coluna de symbol
+                            sym_values = df_idx[sym_col].astype(str).str.strip()
+                            result_rows = []
+                            for eid in ensembl_ids:
+                                eid_str = str(eid).strip()
+                                if eid_str in df_idx.index:
+                                    sym = sym_values.loc[eid_str]
+                                    if isinstance(sym, pd.Series):
+                                        sym = sym.iloc[0]
+                                    if sym and sym not in ('nan', '', 'None', 'NA', '---'):
+                                        result_rows.append({'Probe_ID': eid_str, 'Symbol': sym})
+                            if not result_rows:
+                                # Tentar sem versão
+                                idx_to_sym = {}
+                                for idx_val, sym_val in zip(df_idx.index, sym_values):
+                                    clean = _strip_ensembl_version(idx_val)
+                                    if clean not in idx_to_sym:
+                                        idx_to_sym[clean] = sym_val
+                                for eid in ensembl_ids:
+                                    eid_clean = _strip_ensembl_version(str(eid))
+                                    sym = idx_to_sym.get(eid_clean)
+                                    if sym and sym not in ('nan', '', 'None', 'NA', '---'):
+                                        result_rows.append({'Probe_ID': str(eid), 'Symbol': sym})
+                            if result_rows:
+                                result_df = pd.DataFrame(result_rows).drop_duplicates('Probe_ID')
+                                return result_df, f"{len(result_df)}/{len(ensembl_ids)} IDs mapeados via arquivo suplementar `{fname}`."
+
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return None, "Nenhum arquivo suplementar continha mapeamento Ensembl→Symbol."
 
 
 def _try_supplementary(gse_id, log_cb=None):
@@ -381,24 +583,25 @@ def _sync_suppl_columns_with_gsms(df_suppl, gsm_order):
 
 def get_geo_full_data(gse_id, mode, log_cb=None):
     """
-    Retorna (df_matrix, meta_df, gsms, gsm_order, source, error).
+    Retorna (df_matrix, meta_df, gsms, gsm_order, source, error, detected_type).
+    detected_type: 'Microarray', 'RNASeq' ou 'unknown' — detectado a partir dos metadados GEO.
     """
     if log_cb:
         log_cb("Buscando metadados e Series Matrix...")
 
-    df_matrix, meta_df, gsms, gsm_order = _try_series_matrix(gse_id)
+    df_matrix, meta_df, gsms, gsm_order, detected_type = _try_series_matrix(gse_id)
 
     if meta_df is None:
-        return None, None, None, [], None, "Falha ao acessar o GEO. Verifique o GSE ID."
+        return None, None, None, [], None, "Falha ao acessar o GEO. Verifique o GSE ID.", 'unknown'
 
     if mode == "Microarray":
         if df_matrix is not None:
-            return df_matrix, meta_df, gsms, gsm_order, "Series Matrix", None
-        return None, meta_df, gsms, gsm_order, None, None
+            return df_matrix, meta_df, gsms, gsm_order, "Series Matrix", None, detected_type
+        return None, meta_df, gsms, gsm_order, None, None, detected_type
 
     # RNA-Seq: cascata
     if df_matrix is not None and df_matrix.shape[1] >= 2:
-        return df_matrix, meta_df, gsms, gsm_order, "Series Matrix", None
+        return df_matrix, meta_df, gsms, gsm_order, "Series Matrix", None, detected_type
 
     if log_cb:
         log_cb("Series Matrix sem dados de expressão. Buscando arquivos suplementares...")
@@ -407,18 +610,18 @@ def get_geo_full_data(gse_id, mode, log_cb=None):
         df_synced, sync_method = _sync_suppl_columns_with_gsms(df_suppl, gsm_order)
         if log_cb:
             log_cb(f"Sincronização de colunas: {sync_method}")
-        return df_synced, meta_df, gsms, gsm_order, f"Supplementary TXT ({sync_method})", None
+        return df_synced, meta_df, gsms, gsm_order, f"Supplementary TXT ({sync_method})", None, detected_type
 
     if log_cb:
         log_cb("Suplementares não encontrados. Tentando NCBI-generated counts...")
     df_ncbi = _try_ncbi_generated(gse_id, log_cb=log_cb)
     if df_ncbi is not None:
         df_synced, sync_method = _sync_suppl_columns_with_gsms(df_ncbi, gsm_order)
-        return df_synced, meta_df, gsms, gsm_order, f"NCBI-generated ({sync_method})", None
+        return df_synced, meta_df, gsms, gsm_order, f"NCBI-generated ({sync_method})", None, detected_type
 
     if log_cb:
         log_cb("Nenhuma fonte automática encontrou dados. Upload manual necessário.")
-    return None, meta_df, gsms, gsm_order, None, None
+    return None, meta_df, gsms, gsm_order, None, None, detected_type
 
 
 # ============================================================
@@ -428,7 +631,7 @@ def get_geo_full_data(gse_id, mode, log_cb=None):
 def reset_analysis_state():
     for k in ['df', 'meta_df', 'res', 'analysis_done', 'mapping', 'mapping_msg',
               'raw_gpl', 'mode', 'norm_df', 'rn', 'tn', 'gse_id',
-              'gsms', 'gsm_order', 'matrix_source', 'id_type']:
+              'gsms', 'gsm_order', 'matrix_source', 'id_type', 'detected_type']:
         st.session_state.pop(k, None)
     st.session_state['groups'] = {}
     st.session_state['group_field_key'] = st.session_state.get('group_field_key', 0) + 1
@@ -461,11 +664,21 @@ def run_app():
     with st.sidebar:
         st.header("1. GEO Input")
         mode = st.radio("Experiment Type:", ["Microarray", "RNASeq"])
-        gse_input = st.text_input("GSE ID:", value="GSE117769")
+        gse_input = st.text_input("GSE ID:", placeholder="Ex: GSE117769")
         fetch_btn = st.button("🚀 Fetch Data", use_container_width=True)
 
         if 'meta_df' in st.session_state:
             st.divider()
+            det = st.session_state.get('detected_type', 'unknown')
+            if det != 'unknown':
+                tipo_label = "🧬 RNA-Seq" if det == 'RNASeq' else "🔬 Microarray"
+                st.caption(f"🏷️ Tecnologia detectada: **{tipo_label}**")
+                if st.session_state.get('mode') and st.session_state['mode'] != det:
+                    st.warning(
+                        f"⚠️ Tipo selecionado (**{st.session_state['mode']}**) "
+                        f"difere do detectado (**{det}**). "
+                        f"Considere trocar para **{det}** e clicar em Fetch novamente."
+                    )
             if st.session_state.get('matrix_source'):
                 st.caption(f"📦 Fonte: **{st.session_state['matrix_source']}**")
             if st.session_state.get('id_type'):
@@ -518,7 +731,7 @@ def run_app():
             log_placeholder.info("\n\n".join(log_lines))
 
         with st.spinner("🚀 Buscando dados do GEO..."):
-            df, meta_df, gsms, gsm_order, source, err = get_geo_full_data(
+            df, meta_df, gsms, gsm_order, source, err, detected_type = get_geo_full_data(
                 gse_input.strip(), mode, log_cb=log_cb
             )
 
@@ -533,6 +746,18 @@ def run_app():
             st.session_state['gse_id'] = gse_input.strip()
             st.session_state['matrix_source'] = source
             st.session_state['gsm_order'] = gsm_order
+            st.session_state['detected_type'] = detected_type
+
+            # Aviso se o tipo selecionado difere do detectado
+            if detected_type != 'unknown' and mode != detected_type:
+                det_label = "RNA-Seq" if detected_type == 'RNASeq' else "Microarray"
+                sel_label = "RNA-Seq" if mode == 'RNASeq' else "Microarray"
+                st.warning(
+                    f"⚠️ **Tecnologia incorreta!** Você selecionou **{sel_label}**, mas o GEO indica "
+                    f"que este dataset é **{det_label}** (`!Series_type`). "
+                    f"Troque para **{det_label}** na sidebar e clique em **Fetch Data** novamente "
+                    f"para obter resultados corretos."
+                )
 
             if mode == "Microarray":
                 with st.spinner("🔬 Buscando mapeamento GPL..."):
@@ -546,10 +771,25 @@ def run_app():
                 if df is not None and not df.empty:
                     id_type = detect_index_type(df.index.tolist())
                     st.session_state['id_type'] = id_type
-                    with st.spinner(f"🔗 Mapeando IDs ({id_type}) → Gene Symbol..."):
-                        mapping, msg = get_gene_mapping_rnaseq(
-                            tuple(df.index.astype(str).tolist()), id_type
-                        )
+                    mapping = None
+                    msg = ""
+
+                    if id_type == 'ensembl':
+                        # Estratégia 1: Tentar extrair mapeamento dos suplementares
+                        with st.spinner("🔍 Buscando mapeamento nos arquivos suplementares..."):
+                            mapping, msg = _try_extract_symbol_mapping_from_suppl(
+                                gse_input.strip(),
+                                df.index.astype(str).tolist(),
+                                log_cb=log_cb
+                            )
+
+                    if mapping is None:
+                        # Estratégia 2: MyGene.info (com strip de versão para Ensembl)
+                        with st.spinner(f"🔗 Mapeando IDs ({id_type}) → Gene Symbol via MyGene.info..."):
+                            mapping, msg = get_gene_mapping_rnaseq(
+                                tuple(df.index.astype(str).tolist()), id_type
+                            )
+
                     st.session_state['mapping'] = mapping
                     st.session_state['mapping_msg'] = msg
                 else:
