@@ -10,6 +10,8 @@ import re
 import gc
 from Bio import Entrez
 import statsmodels.api as sm
+from pydeseq2.dds import DeseqDataSet
+from pydeseq2.ds import DeseqStats
 
 HEADERS = {'User-Agent': 'DDEA/1.0 (Streamlit App; +https://github.com)'}
 Entrez.email = "ddea.tool@example.com"
@@ -703,7 +705,7 @@ def run_app():
             st.header("3. Parameters")
             gene_area = st.text_area("Genes to Highlight (1 per line):")
             p_thr = st.slider("P-value threshold:", 0.001, 0.10, 0.05, format="%.3f")
-            fc_thr = st.slider("Min Abs Log2FC:", 0.0, 10.0, 0.0, step=0.1)
+            fc_thr = st.slider("Min Abs Log2FC:", 0.0, 10.0, 1.0, step=0.1)
             if mode == "Microarray":
                 use_limma = st.checkbox("Usar modelo linear (Limma-like)", value=True)
             else:
@@ -938,133 +940,169 @@ def run_app():
     matrix_cols = set(df_matrix.columns.astype(str))
 
     # ----------------------------------------------------------
-    # ANÁLISE MULTI-GRUPO
+    # ANÁLISE DINÂMICA (2 GRUPOS OU MULTI-GRUPO)
     # ----------------------------------------------------------
     if len(updated_groups) >= 2:
         st.divider()
         MAX_GROUPS = 4
         group_names = list(updated_groups.keys())
-        
-        if len(group_names) > MAX_GROUPS:
+        num_groups = len(group_names)
+
+        if num_groups > MAX_GROUPS:
             st.error(f"⚠️ Limite de segurança: O sistema suporta no máximo {MAX_GROUPS} grupos para evitar instabilidade.")
         else:
-            import itertools
-            # Gera todas as combinações possíveis: (A, B), (A, C), (B, C)...
-            comparisons = list(itertools.combinations(group_names, 2))
+            # 1. Configuração da Interface conforme a Tecnologia
+            st.subheader("🧪 Configuração da Análise Estatística")
             
-            st.subheader("🧪 Configuração da Análise")
-            st.info(f"Detectados {len(group_names)} grupos. Serão realizadas {len(comparisons)} comparações par a par + 1 análise global (ANOVA).")
-            
-            # Opção de visualização rápida para o usuário
-            selected_comp = st.selectbox(
-                "Selecione a comparação principal para exibição nos gráficos:",
-                [f"{c[1]} vs {c[0]}" for c in comparisons] + (["Global (ANOVA)"] if len(group_names) > 2 else [])
-            )
+            if mode == "RNASeq":
+                st.info("🧬 **Motor: PyDESeq2 Detectado** | Ideal para contagens de reads e pequenos n biológicos.")
+            else:
+                st.info("🔬 **Motor: Modelos Lineares (Limma-like)** | Ideal para intensidades contínuas de Microarray.")
 
-            if st.button("🔥 Run Multi-Group Analysis", use_container_width=True):
+            if num_groups == 2:
+                c1, c2 = st.columns(2)
+                ref_g = c1.selectbox("Referência (Controle):", group_names, index=0)
+                test_g = c2.selectbox("Teste:", [g for g in group_names if g != ref_g], index=0)
+                button_label = "🔥 Run DESeq2 Analysis" if mode == "RNASeq" else "🔥 Run Analysis"
+                is_multi = False
+            else:
+                import itertools
+                comparisons = list(itertools.combinations(group_names, 2))
+                st.warning(f"📊 Análise Multi-Grupo: {num_groups} grupos detectados.")
+                
+                label_global = "Global (LRT)" if mode == "RNASeq" else "Global (ANOVA)"
+                selected_comp = st.selectbox(
+                    "Selecione a comparação principal para os gráficos:",
+                    [f"{c[1]} vs {c[0]}" for c in comparisons] + [label_global]
+                )
+                button_label = "🔥 Run Multi-Group DESeq2" if mode == "RNASeq" else "🔥 Run Multi-Group Analysis"
+                is_multi = True
+
+            # 2. Botão de Execução
+            if st.button(button_label, use_container_width=True):
                 all_results = {}
-                full_norm_df = pd.DataFrame()
+                all_samples_list = []
+                sample_conditions = []
                 
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+                # Mapear todas as amostras participantes
+                for g_name in group_names:
+                    samps = [label_to_gsm[lab] for lab in updated_groups[g_name] if label_to_gsm.get(lab) in matrix_cols]
+                    all_samples_list.extend(samps)
+                    sample_conditions.extend([g_name] * len(samps))
 
-                # 1. LOOP DE COMPARAÇÕES PAR A PAR
-                for idx, (g_ref, g_test) in enumerate(comparisons):
-                    comp_name = f"{g_test}_vs_{g_ref}"
-                    status_text.text(f"Processando: {comp_name}...")
+                if not all_samples_list:
+                    st.error("Nenhuma amostra válida selecionada.")
+                    st.stop()
+
+                # --- FLUXO A: RNA-SEQ (PyDESeq2) ---
+                if mode == "RNASeq":
+                    from pydeseq2.dds import DeseqDataSet
+                    from pydeseq2.ds import DeseqStats
                     
-                    c_ref = [label_to_gsm[lab] for lab in updated_groups[g_ref] if label_to_gsm.get(lab) in matrix_cols]
-                    c_test = [label_to_gsm[lab] for lab in updated_groups[g_test] if label_to_gsm.get(lab) in matrix_cols]
-
-                    if not c_ref or not c_test:
-                        continue
-
-                    # Extração e Normalização
-                    data_vals = df_matrix[c_ref + c_test].values.astype(np.float32)
-                    if current_mode == "Microarray":
-                        data_norm_vals = quantile_normalize(data_vals)
-                    else:
-                        data_norm_vals = np.log2(data_vals + 1.0)
-
-                    data_norm = pd.DataFrame(data_norm_vals, columns=c_ref + c_test, index=df_matrix.index)
-                    
-                    # Estatística Par a Par
-                    m1 = data_norm[c_ref].values
-                    m2 = data_norm[c_test].values
-
-                    if current_mode == "Microarray" and use_limma:
-                        p_l, f_l = [], []
-                        for row in range(len(data_norm)):
-                            y = np.concatenate([m1[row], m2[row]])
-                            x = sm.add_constant(np.concatenate([np.zeros(len(c_ref)), np.ones(len(c_test))]))
-                            mod = sm.OLS(y, x).fit()
-                            p_l.append(mod.pvalues[1])
-                            f_l.append(mod.params[1])
-                        pvals, lfc = np.array(p_l), np.array(f_l)
-                    else:
-                        lfc = np.nanmean(m2, axis=1) - np.nanmean(m1, axis=1)
-                        pvals = stats.ttest_ind(m2, m1, axis=1, equal_var=False, nan_policy='omit').pvalue
-
-                    res = pd.DataFrame({
-                        'Probe_ID': df_matrix.index.astype(str),
-                        'Log2FC': lfc,
-                        'PValue': pvals,
-                    }).dropna()
-
-                    # Mapeamento de Símbolos
-                    mapping = st.session_state.get('mapping')
-                    if mapping is not None:
-                        res = res.merge(mapping, on='Probe_ID', how='left')
-                        res['Symbol'] = res['Symbol'].replace(['nan', '---', ' ', 'None'], np.nan).fillna(res['Probe_ID'])
-                    else:
-                        res['Symbol'] = res['Probe_ID']
-
-                    all_results[comp_name] = res
-                    progress_bar.progress((idx + 1) / (len(comparisons) + 1))
-
-                # 2. ANÁLISE GLOBAL (ANOVA) - Apenas se houver 3+ grupos
-                if len(group_names) > 2:
-                    status_text.text("Executando Teste Global (ANOVA)...")
-                    all_samples = []
-                    group_labels = []
-                    for g in group_names:
-                        samps = [label_to_gsm[lab] for lab in updated_groups[g] if label_to_gsm.get(lab) in matrix_cols]
-                        all_samples.extend(samps)
-                        group_labels.append(df_matrix[samps].values)
-
-                    # ANOVA One-way por gene
-                    f_stat, p_anova = stats.f_oneway(*group_labels, axis=1)
-                    
-                    anova_res = pd.DataFrame({
-                        'Probe_ID': df_matrix.index.astype(str),
-                        'Log2FC': f_stat, # Usamos o F-stat no lugar do LFC para visualização de magnitude
-                        'PValue': p_anova,
-                    }).dropna()
-                    
-                    if mapping is not None:
-                        anova_res = anova_res.merge(mapping, on='Probe_ID', how='left')
-                        anova_res['Symbol'] = anova_res['Symbol'].fillna(anova_res['Probe_ID'])
-                    else:
-                        anova_res['Symbol'] = anova_res['Probe_ID']
+                    with st.spinner("🚀 Ajustando modelo Binomial Negativa (PyDESeq2)..."):
+                        counts_df = df_matrix[all_samples_list].T.astype(int)
+                        metadata = pd.DataFrame({'condition': sample_conditions}, index=all_samples_list)
                         
-                    all_results["Global (ANOVA)"] = anova_res
+                        dds = DeseqDataSet(counts=counts_df, metadata=metadata, design_factors="condition")
+                        dds.deseq2()
 
-                # Atualização do Estado
-                # Para manter compatibilidade com seus gráficos, definimos 'res' como a comparação selecionada
-                key_res = selected_comp.replace(" ", "_") if "Global" not in selected_comp else "Global (ANOVA)"
+                        # Contrastes Par a Par
+                        tasks = comparisons if is_multi else [(ref_g, test_g)]
+                        for g_ref_task, g_test_task in tasks:
+                            stat_res = DeseqStats(dds, contrast=["condition", g_test_task, g_ref_task])
+                            stat_res.summary()  # EXECUTAR O SUMMARY PRIMEIRO PARA GERAR O DATAFRAME
+                            
+                            res_df = stat_res.results_df.copy() # Agora o atributo existe
+                            res_df['Probe_ID'] = res_df.index.astype(str)
+                            res_df = res_df.rename(columns={'log2FoldChange': 'Log2FC', 'pvalue': 'PValue'})
+                            all_results[f"{g_test_task}_vs_{g_ref_task}"] = res_df
+
+                        # Teste Global (LRT)
+                        if is_multi:
+                            with st.spinner("Calculando Teste Global (LRT)..."):
+                                # O construtor exige o 'contrast' mesmo para o LRT. 
+                                # Usamos o primeiro contraste possível apenas para inicializar.
+                                first_contrast = ["condition", group_names[1], group_names[0]]
+                                stat_lrt = DeseqStats(dds, contrast=first_contrast) 
+                                
+                                # O test_type="LRT" aqui é o que realmente define a análise global
+                                stat_lrt.summary(test_type="LRT", reduced_design="~1") 
+                                
+                                lrt_df = stat_lrt.results_df.copy()
+                                lrt_df['Probe_ID'] = lrt_df.index.astype(str)
+                                lrt_df = lrt_df.rename(columns={'log2FoldChange': 'Log2FC', 'pvalue': 'PValue'})
+                                all_results["Global_(LRT)"] = lrt_df
+
+                # --- FLUXO B: MICROARRAY (OLS/T-TEST) ---
+                else:
+                    with st.spinner("🔬 Calculando Modelos Lineares..."):
+                        # Normalização por quantil para Microarray
+                        data_vals = df_matrix[all_samples_list].values.astype(np.float32)
+                        data_norm_vals = quantile_normalize(data_vals)
+                        data_norm = pd.DataFrame(data_norm_vals, columns=all_samples_list, index=df_matrix.index)
+                        
+                        tasks = comparisons if is_multi else [(ref_g, test_g)]
+                        for g_ref_task, g_test_task in tasks:
+                            c_ref = [label_to_gsm[lab] for lab in updated_groups[g_ref_task] if label_to_gsm.get(lab) in matrix_cols]
+                            c_test = [label_to_gsm[lab] for lab in updated_groups[g_test_task] if label_to_gsm.get(lab) in matrix_cols]
+                            
+                            m1, m2 = data_norm[c_ref].values, data_norm[c_test].values
+                            
+                            if use_limma:
+                                p_l, f_l = [], []
+                                for row in range(len(data_norm)):
+                                    y = np.concatenate([m1[row], m2[row]])
+                                    x = sm.add_constant(np.concatenate([np.zeros(len(c_ref)), np.ones(len(c_test))]))
+                                    mod = sm.OLS(y, x).fit()
+                                    p_l.append(mod.pvalues[1])
+                                    f_l.append(mod.params[1])
+                                pvals, lfc = np.array(p_l), np.array(f_l)
+                            else:
+                                lfc = np.nanmean(m2, axis=1) - np.nanmean(m1, axis=1)
+                                pvals = stats.ttest_ind(m2, m1, axis=1, equal_var=False).pvalue
+                            
+                            all_results[f"{g_test_task}_vs_{g_ref_task}"] = pd.DataFrame({
+                                'Probe_ID': df_matrix.index.astype(str),
+                                'Log2FC': lfc, 'PValue': pvals
+                            }).dropna()
+
+                        # ANOVA Global
+                        if is_multi:
+                            group_arrays = [data_norm[[label_to_gsm[lab] for lab in updated_groups[g] if label_to_gsm.get(lab) in matrix_cols]].values for g in group_names]
+                            f_stat, p_anova = stats.f_oneway(*group_arrays, axis=1)
+                            all_results["Global_(ANOVA)"] = pd.DataFrame({
+                                'Probe_ID': df_matrix.index.astype(str),
+                                'Log2FC': f_stat, 'PValue': p_anova
+                            }).dropna()
+
+                # 3. Mapeamento de Gene Symbols e Finalização
+                mapping = st.session_state.get('mapping')
+                for key in all_results:
+                    df_res = all_results[key]
+                    if mapping is not None:
+                        df_res = df_res.merge(mapping, on='Probe_ID', how='left')
+                        df_res['Symbol'] = df_res['Symbol'].replace(['nan', 'None', ''], np.nan).fillna(df_res['Probe_ID'])
+                    else:
+                        df_res['Symbol'] = df_res['Probe_ID']
+                    all_results[key] = df_res
+
+                # 4. Salvar no Estado para exibição
+                display_key = selected_comp.replace(" ", "_") if is_multi else f"{test_g}_vs_{ref_g}"
                 
+                # Se for RNA-Seq, a norm_df para os gráficos deve ser em Log2
+                if mode == "RNASeq":
+                    norm_display = np.log2(df_matrix[all_samples_list] + 1.0)
+                else:
+                    norm_display = data_norm # Já normalizado por quantil acima
+
                 st.session_state.update({
                     'all_results': all_results,
-                    'res': all_results.get(selected_comp.replace(" ", "_"), all_results.get("Global (ANOVA)")),
+                    'res': all_results.get(display_key),
                     'analysis_done': True,
-                    'rn': selected_comp.split(' vs ')[1] if ' vs ' in selected_comp else "Vários",
-                    'tn': selected_comp.split(' vs ')[0] if ' vs ' in selected_comp else "Global",
-                    'norm_df': df_matrix[all_samples] if len(group_names)>2 else data_norm # Simplificado
+                    'rn': ref_g if not is_multi else selected_comp.split(' vs ')[1] if ' vs ' in selected_comp else "Vários",
+                    'tn': test_g if not is_multi else selected_comp.split(' vs ')[0] if ' vs ' in selected_comp else "Global",
+                    'norm_df': norm_display
                 })
-                
-                progress_bar.empty()
-                status_text.success("Análise concluída!")
-                gc.collect()
                 st.rerun()
 
     # ----------------------------------------------------------
